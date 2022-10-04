@@ -67,6 +67,7 @@ function display_usage() {
   echo -e "\tMAX_BACKGROUND_JOBS\t\tThe value for max_background_jobs (default: 16)"
   echo -e "\tCACHE_INDEX_AND_FILTER_BLOCKS\tThe value for cache_index_and_filter_blocks (default: 0)"
   echo -e "\tUSE_O_DIRECT\t\t\tUse O_DIRECT for user reads and compaction"
+  echo -e "\tBYTES_PER_SYNC\t\t\tValue for bytes_per_sync, set to zero when USE_O_DIRECT is true"
   echo -e "\tSTATS_INTERVAL_SECONDS\t\tValue for stats_interval_seconds"
   echo -e "\tREPORT_INTERVAL_SECONDS\t\tValue for report_interval_seconds"
   echo -e "\tSUBCOMPACTIONS\t\t\tValue for subcompactions"
@@ -95,6 +96,7 @@ function display_usage() {
   echo -e "\tUSE_SHARED_BLOCK_AND_BLOB_CACHE\t\t\tUse the same backing cache for block cache and blob cache (default: 1)"
   echo -e "\tBLOB_CACHE_SIZE\t\t\tSize of the blob cache (default: 16GB)"
   echo -e "\tBLOB_CACHE_NUMSHARDBITS\t\t\tNumber of shards for the blob cache is 2 ** blob_cache_numshardbits (default: 6)"
+  echo -e "\tPREPOPULATE_BLOB_CACHE\t\t\tPre-populate hot/warm blobs in blob cache (default: 0)"
 }
 
 if [ $# -lt 1 ]; then
@@ -181,7 +183,7 @@ target_file_mb=${TARGET_FILE_SIZE_BASE_MB:-128}
 l1_mb=${MAX_BYTES_FOR_LEVEL_BASE_MB:-1024}
 max_background_jobs=${MAX_BACKGROUND_JOBS:-16}
 stats_interval_seconds=${STATS_INTERVAL_SECONDS:-60}
-report_interval_seconds=${REPORT_INTERVAL_SECONDS:-5}
+report_interval_seconds=${REPORT_INTERVAL_SECONDS:-1}
 subcompactions=${SUBCOMPACTIONS:-1}
 per_level_fanout=${PER_LEVEL_FANOUT:-8}
 
@@ -191,7 +193,7 @@ if [[ $cache_index_and_filter -eq 0 ]]; then
 elif [[ $cache_index_and_filter -eq 1 ]]; then
   cache_meta_flags="\
   --cache_index_and_filter_blocks=$cache_index_and_filter \
-  --cache_high_pri_pool_ratio=0.5"
+  --cache_high_pri_pool_ratio=0.5 --cache_low_pri_pool_ratio=0"
 else
   echo CACHE_INDEX_AND_FILTER_BLOCKS was $CACHE_INDEX_AND_FILTER_BLOCKS but must be 0 or 1
   exit $EXIT_INVALID_ARGS
@@ -213,9 +215,11 @@ fi
 
 o_direct_flags=""
 if [ ! -z $USE_O_DIRECT ]; then
-  # TODO: deal with flags only supported in new versions, like prepopulate_block_cache
-  #o_direct_flags="--use_direct_reads --use_direct_io_for_flush_and_compaction --prepopulate_block_cache=1"
-  o_direct_flags="--use_direct_reads --use_direct_io_for_flush_and_compaction"
+  # Some of these flags are only supported in new versions and --undefok makes that work
+  o_direct_flags="--use_direct_reads --use_direct_io_for_flush_and_compaction --prepopulate_block_cache=1"
+  bytes_per_sync=0
+else
+  bytes_per_sync=${BYTES_PER_SYNC:-$(( 1 * M ))}
 fi
 
 univ_min_merge_width=${UNIVERSAL_MIN_MERGE_WIDTH:-2}
@@ -239,8 +243,20 @@ use_blob_cache=${USE_BLOB_CACHE:-1}
 use_shared_block_and_blob_cache=${USE_SHARED_BLOCK_AND_BLOB_CACHE:-1}
 blob_cache_size=${BLOB_CACHE_SIZE:-$(( 16 * $G ))}
 blob_cache_numshardbits=${BLOB_CACHE_NUMSHARDBITS:-6}
+prepopulate_blob_cache=${PREPOPULATE_BLOB_CACHE:-0}
+
+# This script still works back to RocksDB 6.0
+undef_params="\
+use_blob_cache,\
+use_shared_block_and_blob_cache,\
+blob_cache_size,blob_cache_numshardbits,\
+prepopulate_blob_cache,\
+multiread_batched,\
+cache_low_pri_pool_ratio,\
+prepopulate_block_cache"
 
 const_params_base="
+  --undefok=$undef_params \
   --db=$DB_DIR \
   --wal_dir=$WAL_DIR \
   \
@@ -253,7 +269,7 @@ const_params_base="
   --compression_max_dict_bytes=$compression_max_dict_bytes \
   --compression_ratio=0.5 \
   --compression_type=$compression_type \
-  --bytes_per_sync=$((8 * M)) \
+  --bytes_per_sync=$bytes_per_sync \
   $cache_meta_flags \
   $o_direct_flags \
   --benchmark_write_rate_limit=$(( 1024 * 1024 * $mb_written_per_sec )) \
@@ -290,7 +306,7 @@ level_const_params="
   $hard_pending_arg \
 "
 
-# TODO: these inherit level_const_params because the non-blob LSM tree uses leveled compaction
+# These inherit level_const_params because the non-blob LSM tree uses leveled compaction.
 blob_const_params="
   $level_const_params \
   --enable_blob_files=true \
@@ -305,6 +321,7 @@ blob_const_params="
   --use_shared_block_and_blob_cache=$use_shared_block_and_blob_cache \
   --blob_cache_size=$blob_cache_size \
   --blob_cache_numshardbits=$blob_cache_numshardbits \
+  --prepopulate_blob_cache=$prepopulate_blob_cache \
 "
 
 # TODO:
@@ -388,7 +405,7 @@ params_univ_compact="$const_params \
                 --level0_slowdown_writes_trigger=16 \
                 --level0_stop_writes_trigger=20"
 
-tsv_header="ops_sec\tmb_sec\tlsm_sz\tblob_sz\tc_wgb\tw_amp\tc_mbps\tc_wsecs\tc_csecs\tb_rgb\tb_wgb\tusec_op\tp50\tp99\tp99.9\tp99.99\tpmax\tuptime\tstall%\tNstall\tu_cpu\ts_cpu\trss\ttest\tdate\tversion\tjob_id\tfullver\tgitsha"
+tsv_header="ops_sec\tmb_sec\tlsm_sz\tblob_sz\tc_wgb\tw_amp\tc_mbps\tc_wsecs\tc_csecs\tb_rgb\tb_wgb\tusec_op\tp50\tp99\tp99.9\tp99.99\tpmax\tuptime\tstall%\tNstall\tu_cpu\ts_cpu\trss\ttest\tdate\tversion\tjob_id\tgithash"
 
 function get_cmd() {
   output=$1
@@ -427,6 +444,8 @@ function month_to_num() {
     echo $date_str
 }
 
+PERF_METRIC=${PERF_METRIC:-cycles}
+
 function start_stats {
   output=$1
   iostat -y -mx 1  >& $output.io &
@@ -447,10 +466,127 @@ function start_stats {
   done >& $output.sizes &
   # This sets a global value
   szpid=$!
+
+  x=0
+  perfpid=0
+  if [ $x -gt 0 ]; then
+  #fgp="$HOME/git/FlameGraph.me"
+  #if [ ! -d $fgp ]; then echo FlameGraph not found; exit 1; fi
+  echo PERF_METRIC is $PERF_METRIC
+  while :; do
+    if [ $num_threads -eq 1 ]; then
+      perf_secs=30
+    else
+      perf_secs=10
+    fi
+    pause_secs=20
+    perf="perf"
+
+    sleep $pause_secs
+
+    dbbpid=$( ps aux | grep db_bench | grep -v \/usr\/bin\/time | grep -v timeout | grep -v grep | awk '{ print $2 }' )
+    if [ -z $dbbpid ]; then echo Cannot get db_bench PID; continue; fi
+
+    ts=$( date +'%b%d.%H%M%S' )
+    sfx="$x.$ts"
+    outf="$output.perf.rec.g.$sfx"
+    echo "$perf record -e $PERF_METRIC -c 500000 -g -p $dbbpid -o $outf -- sleep $perf_secs"
+    $perf record -e $PERF_METRIC -c 500000 -g -p $dbbpid -o $outf -- sleep $perf_secs
+
+    #$perf report --stdio --no-children -i $outf > $output.perf.rep.g.f0.c0.$sfx
+    #$perf report --stdio --children    -i $outf > $output.perf.rep.g.f0.c1.$sfx
+    #$perf report --stdio -n -g folded -i $outf > $output.perf.rep.g.f1.cother.$sfx
+    $perf report --stdio -n -g folded -i $outf --no-children > $output.perf.rep.g.f1.c0.$sfx
+    $perf report --stdio -n -g folded -i $outf --children > $output.perf.rep.g.f1.c1.$sfx
+    $perf script -i $outf > $output.perf.rep.g.scr.$sfx
+    gzip --fast $outf
+    # A hack to support differential flamegraphs for db_bench v6.0 vs v6.28
+    #cat $output.perf.rep.g.scr.$sfx | $fgp/stackcollapse-perf.pl | \
+    #    sed 's/DataBlockIter::SeekImpl/DataBlockIter::Seek/g' | \
+    #    sed 's/DataBlockIter::NextImpl/DataBlockIter::Next/g' | \
+    #    sed 's/IndexBlockIter::SeekImpl/IndexBlockIter::Seek/g' \
+    #    > $output.perf.g.fold.$sfx
+    #cat $output.perf.rep.g.scr.$sfx | $fgp/stackcollapse-perf.pl > $output.perf.g.fold.$sfx
+    #$fgp/flamegraph.pl $output.perf.g.fold.$sfx > $output.perf.g.$sfx.svg
+    gzip --fast $output.perf.rep.g.scr.$sfx
+
+
+    sleep $pause_secs
+    ts=$( date +'%b%d.%H%M%S' )
+    sfx="$x.$ts"
+    outf="$output.perf.rec.f.$sfx"
+
+    $perf record -c 500000 -p $dbbpid -o $outf -- sleep $perf_secs
+    $perf report --stdio -i $outf > $output.perf.rep.f.$sfx
+    $perf script -i $outf | gzip --fast > $output.perf.rep.f.scr.$sfx.gz
+    gzip --fast $outf
+
+    x=$(( $x + 1 ))
+  done &
+  # This sets a global value
+  perfpid=$!
+  fi
+
+  y=0
+  perfpid2=0
+  if [ $y -gt 0 ]; then
+  while :; do
+    perf_secs=10
+    pause_secs=30
+    perf="perf"
+
+    sleep $pause_secs
+
+    dbbpid=$( ps aux | grep db_bench | grep -v \/usr\/bin\/time | grep -v timeout | grep -v grep | awk '{ print $2 }' )
+    if [ -z $dbbpid ]; then echo Cannot get db_bench PID; continue; fi
+
+    ts=$( date +'%b%d.%H%M%S' )
+    sfx="$y.$ts"
+    outf="$output.perfstat.$sfx"
+
+    $perf stat -o $outf -e cpu-clock,cycles,bus-cycles,instructions -p $dbbpid -- sleep $perf_secs ; sleep 3
+    $perf stat -o $outf --append -e cache-references,cache-misses,branches,branch-misses -p $dbbpid -- sleep $perf_secs ; sleep 3
+    $perf stat -o $outf --append -e L1-dcache-loads,L1-dcache-load-misses,L1-dcache-stores,L1-icache-loads-misses -p $dbbpid -- sleep $perf_secs ; sleep 3
+    $perf stat -o $outf --append -e dTLB-loads,dTLB-load-misses,dTLB-stores,dTLB-store-misses,dTLB-prefetch-misses -p $dbbpid -- sleep $perf_secs ; sleep 3
+    $perf stat -o $outf --append -e iTLB-load-misses,iTLB-loads -p $dbbpid -- sleep $perf_secs ; sleep 3
+    $perf stat -o $outf --append -e LLC-loads,LLC-load-misses,LLC-stores,LLC-store-misses,LLC-prefetches -p $dbbpid -- sleep $perf_secs ; sleep 3
+    $perf stat -o $outf --append -e alignment-faults,context-switches,migrations,major-faults,minor-faults,faults -p $dbbpid -- sleep $perf_secs ; sleep 3
+
+    y=$(( $y + 1 ))
+  done &
+  perfpid2=$!
+  fi
+
+  z=0
+  perfpid3=0
+  if [ $z -gt 0 ]; then
+  while :; do
+    pause_secs=30
+
+    sleep $pause_secs
+
+    dbbpid=$( ps aux | grep db_bench | grep -v \/usr\/bin\/time | grep -v timeout | grep -v grep | awk '{ print $2 }' )
+    if [ -z $dbbpid ]; then echo Cannot get db_bench PID; continue; fi
+
+    ts=$( date +'%b%d.%H%M%S' )
+    sfx="$z.$ts"
+    outf="$output.pmp.$sfx"
+
+    bash ./pmp.sh $dbbpid $outf
+
+    z=$(( $z + 1 ))
+  done &
+  perfpid3=$!
+  fi
 }
 
 function stop_stats {
   output=$1
+
+  if [ $perfpid -gt 0 ]; then kill $perfpid ; fi
+  if [ $perfpid2 -gt 0 ]; then kill $perfpid2 ; fi
+  if [ $perfpid3 -gt 0 ]; then kill $perfpid3 ; fi
+
   kill $pspid
   kill $szpid
   killall iostat
@@ -491,34 +627,47 @@ function summarize_result {
   test_name=$2
   bench_name=$3
 
-  full_version="$( grep "RocksDB version:" "$DB_DIR"/LOG | head -1 | awk '{ printf "%s", $5 }' )"
-  git_sha="$( grep "Git sha" "$DB_DIR"/LOG | head -1 | awk '{ printf "%s", substr($5, 1, 10) }' )"
+  # In recent versions these can be found directly via db_bench --version, --build_info but
+  # grepping from the log lets this work on older versions.
+  version="$( grep "RocksDB version:" "$DB_DIR"/LOG | head -1 | awk '{ printf "%s", $5 }' )"
+  git_hash="$( grep "Git sha" "$DB_DIR"/LOG | head -1 | awk '{ printf "%s", substr($5, 1, 10) }' )"
 
   # Note that this function assumes that the benchmark executes long enough so
   # that "Compaction Stats" is written to stdout at least once. If it won't
   # happen then empty output from grep when searching for "Sum" will cause
   # syntax errors.
-  version=$( grep ^RocksDB: $test_out | awk '{ print $3 }' )
   date=$( grep ^Date: $test_out | awk '{ print $6 "-" $3 "-" $4 "T" $5 }' )
   my_date=$( month_to_num $date )
   uptime=$( grep ^Uptime\(secs $test_out | tail -1 | awk '{ printf "%.0f", $2 }' )
   stall_pct=$( grep "^Cumulative stall" $test_out| tail -1  | awk '{  print $5 }' )
   nstall=$( grep ^Stalls\(count\):  $test_out | tail -1 | awk '{ print $2 + $6 + $10 + $14 + $18 + $20 }' )
 
+  if ! grep ^"$bench_name" "$test_out" > /dev/null 2>&1 ; then
+    echo -e "failed\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t$test_name\t$my_date\t$version\t$job_id\t$git_hash"
+    return
+  fi
+
   # Output formats
+  # V1: readrandom   :      10.218 micros/op 3131616 ops/sec; 1254.3 MB/s (176144999 of 176144999 found)
+  # The MB/s is mssing for multireadrandom
+  # V1a: multireadrandom :      10.164 micros/op 3148272 ops/sec; (177099990 of 177099990 found)
   # V1: overwrite    :       7.939 micros/op 125963 ops/sec;   50.5 MB/s
   # V2: overwrite    :       7.854 micros/op 127320 ops/sec 1800.001 seconds 229176999 operations;   51.0 MB/s
 
-  format_version=$( grep ^${bench_name} $test_out \
+  format_version=$( grep ^"$bench_name" "$test_out" \
     | awk '{ if (NF >= 10 && $8 == "seconds") { print "V2" } else { print "V1" } }' )
   if [ $format_version == "V1" ]; then
-    ops_sec=$( grep ^${bench_name} $test_out | awk '{ print $5 }' )
-    usecs_op=$( grep ^${bench_name} $test_out | awk '{ printf "%.1f", $3 }' )
-    mb_sec=$( grep ^${bench_name} $test_out | awk '{ print $7 }' )
+    ops_sec=$( grep ^"$bench_name" "$test_out" | awk '{ print $5 }' )
+    usecs_op=$( grep ^"$bench_name" "$test_out" | awk '{ printf "%.1f", $3 }' )
+    if [ "$bench_name" == "multireadrandom" ]; then
+      mb_sec="NA"
+    else
+      mb_sec=$( grep ^"$bench_name" "$test_out" | awk '{ print $7 }' )
+    fi
   else
-    ops_sec=$( grep ^${bench_name} $test_out | awk '{ print $5 }' )
-    usecs_op=$( grep ^${bench_name} $test_out | awk '{ printf "%.1f", $3 }' )
-    mb_sec=$( grep ^${bench_name} $test_out | awk '{ print $11 }' )
+    ops_sec=$( grep ^"$bench_name" "$test_out" | awk '{ print $5 }' )
+    usecs_op=$( grep ^"$bench_name" "$test_out" | awk '{ printf "%.1f", $3 }' )
+    mb_sec=$( grep ^"$bench_name" "$test_out" | awk '{ print $11 }' )
   fi
 
   # For RocksDB version 4.x there are fewer fields but this still parses correctly
@@ -567,7 +716,7 @@ function summarize_result {
 
   rss="NA"
   if [ -f $test_out.stats.ps ]; then
-    rss=$(  tail -1 $test_out.stats.ps | awk '{ printf "%.1f\n", $6 / (1024 * 1024) }' )
+    rss=$( awk '{ printf "%.1f\n", $6 / (1024 * 1024) }' $test_out.stats.ps | sort -n | tail -1 )
   fi
 
   # if the report TSV (Tab Separate Values) file does not yet exist, create it and write the header row to it
@@ -596,12 +745,11 @@ function summarize_result {
     echo -e "# date - Date/time of test" >> $report
     echo -e "# version - RocksDB version" >> $report
     echo -e "# job_id - User-provided job ID" >> $report
-    echo -e "# fullver - Full version" >> $report
-    echo -e "# gitsha - Git hash at which binary was built" >> $report
+    echo -e "# githash - git hash at which db_bench was compiled"
     echo -e $tsv_header >> $report
   fi
 
-  echo -e "$ops_sec\t$mb_sec\t$lsm_size\t$blob_size\t$sum_wgb\t$wamp\t$cmb_ps\t$c_wsecs\t$c_csecs\t$b_rgb\t$b_wgb\t$usecs_op\t$p50\t$p99\t$p999\t$p9999\t$pmax\t$uptime\t$stall_pct\t$nstall\t$u_cpu\t$s_cpu\t$rss\t$test_name\t$my_date\t$version\t$job_id\t$full_version\t$git_sha" \
+  echo -e "$ops_sec\t$mb_sec\t$lsm_size\t$blob_size\t$sum_wgb\t$wamp\t$cmb_ps\t$c_wsecs\t$c_csecs\t$b_rgb\t$b_wgb\t$usecs_op\t$p50\t$p99\t$p999\t$p9999\t$pmax\t$uptime\t$stall_pct\t$nstall\t$u_cpu\t$s_cpu\t$rss\t$test_name\t$my_date\t$version\t$job_id\t$git_hash" \
     >> $report
 }
 
@@ -611,7 +759,7 @@ function run_bulkload {
   echo "Bulk loading $num_keys random keys"
   log_file_name=$output_dir/benchmark_bulkload_fillrandom.log
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=fillrandom \
+  cmd="$time_cmd ./db_bench --benchmarks=fillrandom,stats \
        --use_existing_db=0 \
        --disable_auto_compactions=1 \
        --sync=0 \
@@ -635,7 +783,7 @@ function run_bulkload {
   echo "Compacting..."
   log_file_name=$output_dir/benchmark_bulkload_compact.log
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=compact \
+  cmd="$time_cmd ./db_bench --benchmarks=compact,stats \
        --use_existing_db=1 \
        --disable_auto_compactions=1 \
        --sync=0 \
@@ -675,7 +823,7 @@ function run_manual_compaction_worker {
 
   # Make sure that fillrandom uses the same compaction options as compact.
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=fillrandom \
+  cmd="$time_cmd ./db_bench --benchmarks=fillrandom,stats \
        --use_existing_db=0 \
        --disable_auto_compactions=0 \
        --sync=0 \
@@ -709,7 +857,7 @@ function run_manual_compaction_worker {
   # doesn't output regular statistics then we'll just use the time command to
   # measure how long this step takes.
   cmd="{ \
-       time ./db_bench --benchmarks=compact \
+       time ./db_bench --benchmarks=compact,stats \
        --use_existing_db=1 \
        --disable_auto_compactions=0 \
        --sync=0 \
@@ -795,7 +943,7 @@ function run_fillseq {
 
   echo "Loading $num_keys keys sequentially"
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=fillseq \
+  cmd="$time_cmd ./db_bench --benchmarks=fillseq,stats \
        $params_fillseq \
        $comp_arg \
        --use_existing_db=0 \
@@ -838,7 +986,7 @@ function run_lsm {
 
   log_file_name=$output_dir/benchmark_${job}.log
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=$benchmarks \
+  cmd="$time_cmd ./db_bench --benchmarks=$benchmarks,stats \
        --use_existing_db=1 \
        --sync=0 \
        $params_w \
@@ -866,7 +1014,7 @@ function run_change {
   echo "Do $num_keys random $output_name"
   log_file_name="$output_dir/benchmark_${output_name}.t${num_threads}.s${syncval}.log"
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=$benchmarks \
+  cmd="$time_cmd ./db_bench --benchmarks=$benchmarks,stats \
        --use_existing_db=1 \
        --sync=$syncval \
        $params_w \
@@ -891,7 +1039,7 @@ function run_filluniquerandom {
   echo "Loading $num_keys unique keys randomly"
   log_file_name=$output_dir/benchmark_filluniquerandom.log
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=filluniquerandom \
+  cmd="$time_cmd ./db_bench --benchmarks=filluniquerandom,stats \
        --use_existing_db=0 \
        --sync=0 \
        $params_w \
@@ -915,7 +1063,7 @@ function run_readrandom {
   echo "Reading $num_keys random keys"
   log_file_name="${output_dir}/benchmark_readrandom.t${num_threads}.log"
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=readrandom \
+  cmd="$time_cmd ./db_bench --benchmarks=readrandom,stats \
        --use_existing_db=1 \
        $params_w \
        --threads=$num_threads \
@@ -938,7 +1086,7 @@ function run_multireadrandom {
   echo "Multi-Reading $num_keys random keys"
   log_file_name="${output_dir}/benchmark_multireadrandom.t${num_threads}.log"
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=multireadrandom \
+  cmd="$time_cmd ./db_bench --benchmarks=multireadrandom,stats \
        --use_existing_db=1 \
        --threads=$num_threads \
        --batch_size=10 \
@@ -963,7 +1111,7 @@ function run_readwhile {
   echo "Reading $num_keys random keys while $operation"
   log_file_name="${output_dir}/benchmark_readwhile${operation}.t${num_threads}.log"
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench --benchmarks=readwhile${operation} \
+  cmd="$time_cmd ./db_bench --benchmarks=readwhile${operation},stats \
        --use_existing_db=1 \
        --sync=$syncval \
        $params_w \
@@ -991,7 +1139,7 @@ function run_rangewhile {
   log_file_name="${output_dir}/benchmark_${full_name}.t${num_threads}.log"
   time_cmd=$( get_cmd $log_file_name.time )
   echo "Range scan $num_keys random keys while ${operation} for reverse_iter=${reverse_arg}"
-  cmd="$time_cmd ./db_bench --benchmarks=seekrandomwhile${operation} \
+  cmd="$time_cmd ./db_bench --benchmarks=seekrandomwhile${operation},stats \
        --use_existing_db=1 \
        --sync=$syncval \
        $params_w \
@@ -1015,7 +1163,7 @@ function run_range {
   log_file_name="${output_dir}/benchmark_${full_name}.t${num_threads}.log"
   time_cmd=$( get_cmd $log_file_name.time )
   echo "Range scan $num_keys random keys for reverse_iter=${reverse_arg}"
-  cmd="$time_cmd ./db_bench --benchmarks=seekrandom \
+  cmd="$time_cmd ./db_bench --benchmarks=seekrandom,stats \
        --use_existing_db=1 \
        $params_w \
        --threads=$num_threads \
@@ -1040,7 +1188,7 @@ function run_randomtransaction {
   echo "..."
   log_file_name=$output_dir/benchmark_randomtransaction.log
   time_cmd=$( get_cmd $log_file_name.time )
-  cmd="$time_cmd ./db_bench $params_w --benchmarks=randomtransaction \
+  cmd="$time_cmd ./db_bench $params_w --benchmarks=randomtransaction,stats \
        --num=$num_keys \
        --transaction_db \
        --threads=5 \
